@@ -34,8 +34,33 @@ _state_is_remnawave_container() {
         # Решала VPN Gateway stack — не чужой, наш собственный сервис
         vpn-gateway|vpn-edge-nginx|project_vpn-gateway|project_vpn-edge-nginx)
             return 0 ;;
+        # NullVPN dev-стек (admin-node-2, task39): dev- префиксы при канонических образах.
+        # 2026-10-18: без этого наш собственный dev-стек помечался как "чужой софт"
+        dev-remnawave*|dev-remnanode*|dev-subscription-page*|dev-cabinet*|dev-bot*|e2e_cleanup*|docker-registry|registry)
+            return 0 ;;
         *)
             return 1 ;;
+    esac
+}
+
+# 2026-10-18 NULLVPN FIX (task108): классификация контейнера по Docker-ОБРАЗУ,
+# независимо от имени. Наш dev-стек называет контейнеры dev-remnawave / dev-subscription-page,
+# при этом образы канонические: remnawave/backend, remnawave/subscription-page, remnawave/node.
+# Имя-базированный детект не видел панель и помечал хост как "Сторонний софт".
+# Эхо: panel | node | subpage | "" (не распознан)
+_state_classify_by_image() {
+    local name="$1"
+    local img
+    img=$(run_cmd docker inspect --format='{{.Config.Image}}' "$name" 2>/dev/null || true)
+    case "$img" in
+        *"remnawave/backend"*)
+            echo "panel" ;;
+        *"remnawave/node"*|*remnanode*)
+            echo "node" ;;
+        *"remnawave/subscription-page"*)
+            echo "subpage" ;;
+        *)
+            echo "" ;;
     esac
 }
 
@@ -83,6 +108,20 @@ _state_get_node_version_from_logs() {
 
 # Извлекает версию панели, сканируя логи
 _state_get_panel_version_from_logs() {
+    # 2026-10-18 NULLVPN FIX (task108): принимаем имя найденного панельного контейнера
+    # (для dev-* имён старый name-grep ничего не находит)
+    local preferred_container="${1:-}"
+    if [[ -n "$preferred_container" ]]; then
+        # 2>&1: бэкенд пишет баннер версии в STDERR; без tail: версия в startup-баннере,
+        # хвост может быть забит healthcheck-спамом (grep стриминговый, память не растёт)
+        local p_ver
+        p_ver=$(run_cmd docker logs "$preferred_container" 2>&1 | grep -oE 'Remnawave Backend v[0-9.]*' | tail -n 1 | sed 's/Remnawave Backend v//')
+        if [ -n "$p_ver" ]; then
+            echo "${p_ver}"
+            return
+        fi
+    fi
+
     local container_names
     # grep -E: ищем как remnawave-* так и просто remnawave (новые версии)
     container_names=$(run_cmd docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^remnawave(-|$)") || true
@@ -212,16 +251,37 @@ scan_remnawave_state() {
             fi
             # Остальные remnawave-* (redis, db, scheduler и т.д.) — вспомогательные, не «чужие»
         else
-            if ! _state_is_remnawave_container "$name"; then
-                has_foreign=1
-            fi
+            # 2026-10-18 NULLVPN FIX (task108): сначала пробуем классифицировать по ОБРАЗУ
+            # (работает для любых имён: dev-*, <project>_*, кастомные префиксы),
+            # и только нераспознанные считаем чужими.
+            local _img_class
+            _img_class=$(_state_classify_by_image "$name")
+            case "$_img_class" in
+                panel)
+                    is_panel=1
+                    panel_container="$name"
+                    ;;
+                node)
+                    is_node=1
+                    node_container="$name"
+                    ;;
+                subpage)
+                    is_subpage=1
+                    subpage_container="$name"
+                    ;;
+                *)
+                    if ! _state_is_remnawave_container "$name"; then
+                        has_foreign=1
+                    fi
+                    ;;
+            esac
         fi
     done <<< "$container_names"
 
     if [ $is_panel -eq 1 ] && [ $is_node -eq 1 ] && [ $is_subpage -eq 1 ]; then
         SERVER_TYPE="Панель, Нода и Sub-page"
         PANEL_NODE_PATH=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$panel_container" 2>/dev/null)
-        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs)
+        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs "$panel_container")
         PANEL_VERSION=$(_state_clean_version "$raw_p_ver")
         local raw_n_ver; raw_n_ver=$(_state_get_node_version_from_logs "$node_container")
         NODE_VERSION=$(_state_clean_version "$raw_n_ver")
@@ -232,7 +292,7 @@ scan_remnawave_state() {
     elif [ $is_panel -eq 1 ] && [ $is_node -eq 1 ]; then
         SERVER_TYPE="Панель и Нода"
         PANEL_NODE_PATH=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$panel_container" 2>/dev/null)
-        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs)
+        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs "$panel_container")
         PANEL_VERSION=$(_state_clean_version "$raw_p_ver")
         local raw_n_ver; raw_n_ver=$(_state_get_node_version_from_logs "$node_container")
         NODE_VERSION=$(_state_clean_version "$raw_n_ver")
@@ -240,7 +300,7 @@ scan_remnawave_state() {
     elif [ $is_panel -eq 1 ] && [ $is_subpage -eq 1 ]; then
         SERVER_TYPE="Панель + Sub-page"
         PANEL_NODE_PATH=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$panel_container" 2>/dev/null)
-        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs)
+        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs "$panel_container")
         PANEL_VERSION=$(_state_clean_version "$raw_p_ver")
         local raw_sub_ver
         raw_sub_ver=$(run_cmd docker logs "$subpage_container" 2>/dev/null | grep -oE 'Remnawave Subscription Page v[0-9.]*' | tail -n 1 | sed 's/Remnawave Subscription Page v//')
@@ -249,7 +309,7 @@ scan_remnawave_state() {
     elif [ $is_panel -eq 1 ]; then
         SERVER_TYPE="Панель"
         PANEL_NODE_PATH=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$panel_container" 2>/dev/null)
-        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs)
+        local raw_p_ver; raw_p_ver=$(_state_get_panel_version_from_logs "$panel_container")
         PANEL_VERSION=$(_state_clean_version "$raw_p_ver")
 
     elif [ $is_subpage -eq 1 ] && [ $is_node -eq 1 ]; then
@@ -283,19 +343,22 @@ scan_remnawave_state() {
     # Помечаем, что картина мира по Remnawave/боту собрана и её можно переиспользовать
     REMNA_STATE_SCANNED=1
 
-    if echo "$container_names" | grep -q "^remnawave_bot$"; then
+    # 2026-10-18 NULLVPN FIX (task108): substring search (catches dev-remnawave_bot etc.)
+    local bot_container
+    bot_container=$(echo "$container_names" | grep "remnawave_bot" | head -n 1)
+    if [[ -n "$bot_container" ]]; then
         BOT_DETECTED=1
         local bot_compose_path
-        bot_compose_path=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "remnawave_bot" 2>/dev/null || true)
+        bot_compose_path=$(run_cmd docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$bot_container" 2>/dev/null || true)
         if [ -n "$bot_compose_path" ]; then
             BOT_PATH=$(dirname "$bot_compose_path")
             if [ -f "$BOT_PATH/VERSION" ]; then
                 BOT_VERSION=$(cat "$BOT_PATH/VERSION")
             else
-                BOT_VERSION=$(_state_get_docker_version "remnawave_bot")
+                BOT_VERSION=$(_state_get_docker_version "$bot_container")
             fi
         else
-            BOT_VERSION=$(_state_get_docker_version "remnawave_bot")
+            BOT_VERSION=$(_state_get_docker_version "$bot_container")
         fi
         BOT_VERSION=$(_state_clean_version "$BOT_VERSION")
     fi
