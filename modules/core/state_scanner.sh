@@ -81,7 +81,7 @@ _state_clean_version() {
 _state_get_node_version_from_logs() {
     local container="$1"
     local logs
-    logs=$(run_cmd docker logs --tail 10000 "$container" 2>&1)
+    logs=$(run_cmd docker logs --tail 10000 "$container" 2>&1 | tr -d '\0')
 
     local node_ver
     # Ищем самую свежую запись о версии ноды, допускаем как "v2.2.3", так и "2.2.3"
